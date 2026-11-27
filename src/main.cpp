@@ -53,18 +53,43 @@ static llvm::cl::opt<std::string> output_filename(
   llvm::cl::cat(llvm2lean_category)
 );
 
-static const char* lean_prelude = R"(abbrev Mem := Nat → BitVec 64 → BitVec 8
-abbrev Ptr := Nat × BitVec 64
+static const char* lean_prelude = R"(abbrev Ptr := Nat × BitVec 64
+
+def Ptr.null : Ptr := (0, 0)
+
+structure Mem where
+  regions : Nat → Unit ⊕ (BitVec 64 → BitVec 8 ⊕ Ptr)
+  next : Nat
+
+instance : Inhabited Mem := ⟨⟨fun _ => Sum.inl (), 1⟩⟩
+
+def Mem.cell (mem : Mem) (ptr : Ptr) : BitVec 8 ⊕ Ptr :=
+  (mem.regions ptr.1).elim (fun _ => Sum.inl 0) (fun region => region ptr.2)
+
+def Mem.write (mem : Mem) (ptr : Ptr) (size : Nat) (cell : Nat → BitVec 8 ⊕ Ptr) : Mem :=
+  { mem with regions := fun id =>
+    if id = ptr.1 then
+      (mem.regions id).map (fun u => u) (fun region offset => if (offset - ptr.2).toNat < size then cell (offset - ptr.2).toNat else region offset)
+    else
+      mem.regions id }
 
 def Mem.load (mem : Mem) (ptr : Ptr) (w : Nat) : BitVec w :=
-  BitVec.ofNat w ((List.range ((w + 7) / 8)).foldr (fun i acc => (mem ptr.1 (ptr.2 + BitVec.ofNat 64 i)).toNat + acc * 256) 0)
+  BitVec.ofNat w ((List.range ((w + 7) / 8)).foldr (fun i acc => ((mem.cell (ptr.1, ptr.2 + BitVec.ofNat 64 i)).elim id (fun _ => 0)).toNat + acc * 256) 0)
 
 def Mem.store {w : Nat} (mem : Mem) (ptr : Ptr) (value : BitVec w) : Mem :=
-  fun id offset =>
-    if id = ptr.1 ∧ (offset - ptr.2).toNat < (w + 7) / 8 then
-      BitVec.setWidth 8 (value >>> (8 * (offset - ptr.2).toNat))
-    else
-      mem id offset
+  mem.write ptr ((w + 7) / 8) (fun i => Sum.inl (BitVec.setWidth 8 (value >>> (8 * i))))
+
+def Mem.loadPtr (mem : Mem) (ptr : Ptr) : Ptr :=
+  (mem.cell ptr).elim (fun _ => Ptr.null) id
+
+def Mem.storePtr (mem : Mem) (ptr : Ptr) (value : Ptr) : Mem :=
+  mem.write ptr 8 (fun _ => Sum.inr value)
+
+def Mem.malloc (mem : Mem) (_size : BitVec 64) : Mem × Ptr :=
+  ({ regions := fun id => if id = mem.next then Sum.inr (fun _ => Sum.inl 0) else mem.regions id, next := mem.next + 1 }, (mem.next, 0))
+
+def Mem.free (mem : Mem) (ptr : Ptr) : Mem :=
+  { mem with regions := fun id => if id = ptr.1 then Sum.inl () else mem.regions id }
 
 )";
 
@@ -176,6 +201,8 @@ private:
       stream << " : ";
       lower_type(stream, constant_int->getType());
       stream << ")";
+    } else if (llvm::isa<llvm::ConstantPointerNull>(value)) {
+      stream << "Ptr.null";
     } else {
       assert(false && "Unsupported value");
     }
@@ -280,6 +307,12 @@ private:
       }
     } else if (llvm::LoadInst* load = llvm::dyn_cast<llvm::LoadInst>(inst)) {
       llvm::Type* type = load->getType();
+      if (type->isPointerTy()) {
+        stream << "let " << _names[inst] << " := (Mem.loadPtr mem ";
+        lower_value(stream, load->getPointerOperand());
+        stream << ")\n";
+        return;
+      }
       if (!type->isIntegerTy()) {
         throw std::runtime_error("Unsupported load type");
       }
@@ -291,6 +324,14 @@ private:
       }
     } else if (llvm::StoreInst* store = llvm::dyn_cast<llvm::StoreInst>(inst)) {
       llvm::Value* value = store->getValueOperand();
+      if (value->getType()->isPointerTy()) {
+        stream << "let mem := (Mem.storePtr mem ";
+        lower_value(stream, store->getPointerOperand());
+        stream << " ";
+        lower_value(stream, value);
+        stream << ")\n";
+        return;
+      }
       if (!value->getType()->isIntegerTy()) {
         throw std::runtime_error("Unsupported store type");
       }
@@ -323,6 +364,18 @@ private:
       stream << ")";
     } else if (llvm::CallInst* call = llvm::dyn_cast<llvm::CallInst>(inst)) {
       llvm::Function* callee = call->getCalledFunction();
+      if (callee && callee->isDeclaration() && callee->getName() == "malloc") {
+        stream << "let (mem, " << _names[inst] << ") := (Mem.malloc mem ";
+        lower_value(stream, call->getArgOperand(0));
+        stream << ")\n";
+        return;
+      }
+      if (callee && callee->isDeclaration() && callee->getName() == "free") {
+        stream << "let mem := (Mem.free mem ";
+        lower_value(stream, call->getArgOperand(0));
+        stream << ")\n";
+        return;
+      }
       if (!callee || callee->isDeclaration()) {
         throw std::runtime_error("Unsupported call target");
       }
