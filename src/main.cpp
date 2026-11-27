@@ -55,7 +55,9 @@ private:
   std::unordered_map<llvm::Value*, std::string> _names;
 
   void lower_type(std::ostream& stream, llvm::Type* type) {
-    if (llvm::IntegerType* integer_type = llvm::dyn_cast<llvm::IntegerType>(type)) {
+    if (type->isIntegerTy(1)) {
+      stream << "Bool";
+    } else if (llvm::IntegerType* integer_type = llvm::dyn_cast<llvm::IntegerType>(type)) {
       stream << "(BitVec " << integer_type->getBitWidth() << ")";
     } else if (type->isVoidTy()) {
       stream << "Unit";
@@ -67,6 +69,8 @@ private:
   void lower_value(std::ostream& stream, llvm::Value* value) {
     if (_names.find(value) != _names.end()) {
       stream << _names[value];
+    } else if (value->getType()->isIntegerTy(1) && llvm::isa<llvm::ConstantInt>(value)) {
+      stream << (llvm::cast<llvm::ConstantInt>(value)->isOne() ? "true" : "false");
     } else if (llvm::ConstantInt* constant_int = llvm::dyn_cast<llvm::ConstantInt>(value)) {
       stream << "(";
       llvm::SmallVector<char, 32> str;
@@ -102,26 +106,28 @@ private:
     if (llvm::BinaryOperator* binop = llvm::dyn_cast<llvm::BinaryOperator>(inst)) {
       stream << "let " << _names[inst] << " := ";
 
-      #define simple_binop(Kind, op) \
+      bool is_bool = binop->getType()->isIntegerTy(1);
+
+      #define simple_binop(Kind, op, bool_op) \
         case llvm::Instruction::Kind: \
           stream << "("; \
           lower_value(stream, binop->getOperand(0)); \
-          stream << " " op " "; \
+          stream << " " << (is_bool ? bool_op : op) << " "; \
           lower_value(stream, binop->getOperand(1)); \
           stream << ")"; \
           break;
       
       switch (binop->getOpcode()) {
-        simple_binop(Add, "+")
-        simple_binop(Sub, "-")
-        simple_binop(Mul, "*")
+        simple_binop(Add, "+", "^^")
+        simple_binop(Sub, "-", "^^")
+        simple_binop(Mul, "*", "&&")
         default:
           assert(false && "Unsupported binary operator");
       }
       
       #undef simple_binop
     } else if (llvm::ICmpInst* icmp = llvm::dyn_cast<llvm::ICmpInst>(inst)) {
-      stream << "let " << _names[inst] << " := (BitVec.ofBool ";
+      stream << "let " << _names[inst] << " := ";
 
       #define simple_icmp(Pred, op, swap) \
         case llvm::CmpInst::Pred: \
@@ -148,12 +154,11 @@ private:
       }
 
       #undef simple_icmp
-      stream << ")";
     } else if (llvm::BranchInst* br = llvm::dyn_cast<llvm::BranchInst>(inst)) {
       if (br->isConditional()) {
         stream << "if ";
         lower_value(stream, br->getCondition());
-        stream << " = 1#1 then ";
+        stream << " then ";
         lower_block_call(stream, br->getParent(), br->getSuccessor(0));
         stream << " else ";
         lower_block_call(stream, br->getParent(), br->getSuccessor(1));
