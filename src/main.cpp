@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <memory>
 #include <system_error>
 #include <fstream>
@@ -24,6 +25,7 @@
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/ModuleSlotTracker.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/CommandLine.h>
@@ -53,6 +55,60 @@ class LeanLowering {
 private:
   std::ostream& _stream;
   std::unordered_map<llvm::Value*, std::string> _names;
+  std::unordered_map<llvm::BasicBlock*, std::vector<llvm::Instruction*>> _live_in;
+
+  void compute_live_in(llvm::Function& function) {
+    std::unordered_map<llvm::Instruction*, size_t> order;
+    std::unordered_map<llvm::BasicBlock*, std::set<llvm::Instruction*>> live_in;
+    for (llvm::BasicBlock& block : function) {
+      for (llvm::Instruction& inst : block) {
+        order[&inst] = order.size();
+      }
+    }
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (llvm::BasicBlock& block : llvm::reverse(function)) {
+        std::set<llvm::Instruction*> live;
+        for (llvm::BasicBlock* succ : llvm::successors(&block)) {
+          for (llvm::Instruction* inst : live_in[succ]) {
+            live.insert(inst);
+          }
+          for (llvm::PHINode& phi : succ->phis()) {
+            if (llvm::Instruction* incoming = llvm::dyn_cast<llvm::Instruction>(phi.getIncomingValueForBlock(&block))) {
+              live.insert(incoming);
+            }
+          }
+        }
+
+        for (llvm::Instruction& inst : llvm::reverse(block)) {
+          live.erase(&inst);
+          if (llvm::isa<llvm::PHINode>(inst)) {
+            continue;
+          }
+          for (llvm::Value* operand : inst.operands()) {
+            if (llvm::Instruction* operand_inst = llvm::dyn_cast<llvm::Instruction>(operand)) {
+              live.insert(operand_inst);
+            }
+          }
+        }
+
+        if (live != live_in[&block]) {
+          live_in[&block] = live;
+          changed = true;
+        }
+      }
+    }
+
+    for (llvm::BasicBlock& block : function) {
+      std::vector<llvm::Instruction*>& sorted = _live_in[&block];
+      sorted.assign(live_in[&block].begin(), live_in[&block].end());
+      std::sort(sorted.begin(), sorted.end(), [&](llvm::Instruction* a, llvm::Instruction* b) {
+        return order[a] < order[b];
+      });
+    }
+  }
 
   void lower_type(std::ostream& stream, llvm::Type* type) {
     if (type->isIntegerTy(1)) {
@@ -90,16 +146,15 @@ private:
       stream << " ";
       lower_value(stream, phi.getIncomingValueForBlock(from));
     }
+    for (llvm::Instruction* inst : _live_in[to]) {
+      stream << " " << _names[inst];
+    }
     stream << ")";
   }
 
   void lower_inst(std::ostream& stream, llvm::Instruction* inst) {
     if (llvm::isa<llvm::PHINode>(inst)) {
       return;
-    }
-
-    if (!inst->getType()->isVoidTy()) {
-      _names[inst] = "v" + std::to_string(_names.size());
     }
 
     stream << "    ";
@@ -191,7 +246,15 @@ public:
       _names[&arg] = "a" + std::to_string(_names.size());
     }
 
-    _stream << "def " << function.getName().str();
+    for (llvm::Instruction& inst : llvm::instructions(function)) {
+      if (!inst.getType()->isVoidTy()) {
+        _names[&inst] = "v" + std::to_string(_names.size());
+      }
+    }
+
+    compute_live_in(function);
+
+    _stream << "partial def " << function.getName().str();
     for (llvm::Argument& arg : function.args()) {
       _stream << " (" << _names[&arg] << " : ";
       lower_type(_stream, arg.getType());
@@ -205,9 +268,13 @@ public:
     for (llvm::BasicBlock& block : function) {
       _stream << "  " << _names[&block];
       for (llvm::PHINode& phi : block.phis()) {
-        _names[&phi] = "v" + std::to_string(_names.size());
         _stream << " (" << _names[&phi] << " : ";
         lower_type(_stream, phi.getType());
+        _stream << ")";
+      }
+      for (llvm::Instruction* inst : _live_in[&block]) {
+        _stream << " (" << _names[inst] << " : ";
+        lower_type(_stream, inst->getType());
         _stream << ")";
       }
       _stream << " : ";
