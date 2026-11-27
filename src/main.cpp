@@ -57,6 +57,8 @@ private:
   void lower_type(std::ostream& stream, llvm::Type* type) {
     if (llvm::IntegerType* integer_type = llvm::dyn_cast<llvm::IntegerType>(type)) {
       stream << "(BitVec " << integer_type->getBitWidth() << ")";
+    } else if (type->isVoidTy()) {
+      stream << "Unit";
     } else {
       assert(false && "Unsupported type");
     }
@@ -69,7 +71,7 @@ private:
       stream << "(";
       llvm::SmallVector<char, 32> str;
       constant_int->getValue().toStringUnsigned(str, 10);
-      stream << str.data();
+      stream << std::string(str.data(), str.size());
       stream << " : ";
       lower_type(stream, constant_int->getType());
       stream << ")";
@@ -78,8 +80,25 @@ private:
     }
   }
 
+  void lower_block_call(std::ostream& stream, llvm::BasicBlock* from, llvm::BasicBlock* to) {
+    stream << "(" << _names[to];
+    for (llvm::PHINode& phi : to->phis()) {
+      stream << " ";
+      lower_value(stream, phi.getIncomingValueForBlock(from));
+    }
+    stream << ")";
+  }
+
   void lower_inst(std::ostream& stream, llvm::Instruction* inst) {
-    _names[inst] = "v" + std::to_string(_names.size());
+    if (llvm::isa<llvm::PHINode>(inst)) {
+      return;
+    }
+
+    if (!inst->getType()->isVoidTy()) {
+      _names[inst] = "v" + std::to_string(_names.size());
+    }
+
+    stream << "    ";
     if (llvm::BinaryOperator* binop = llvm::dyn_cast<llvm::BinaryOperator>(inst)) {
       stream << "let " << _names[inst] << " := ";
 
@@ -101,11 +120,58 @@ private:
       }
       
       #undef simple_binop
+    } else if (llvm::ICmpInst* icmp = llvm::dyn_cast<llvm::ICmpInst>(inst)) {
+      stream << "let " << _names[inst] << " := (BitVec.ofBool ";
+
+      #define simple_icmp(Pred, op, swap) \
+        case llvm::CmpInst::Pred: \
+          stream << "(" op " "; \
+          lower_value(stream, icmp->getOperand(swap ? 1 : 0)); \
+          stream << " "; \
+          lower_value(stream, icmp->getOperand(swap ? 0 : 1)); \
+          stream << ")"; \
+          break;
+
+      switch (icmp->getPredicate()) {
+        simple_icmp(ICMP_EQ, "BEq.beq", false)
+        simple_icmp(ICMP_NE, "bne", false)
+        simple_icmp(ICMP_ULT, "BitVec.ult", false)
+        simple_icmp(ICMP_ULE, "BitVec.ule", false)
+        simple_icmp(ICMP_UGT, "BitVec.ult", true)
+        simple_icmp(ICMP_UGE, "BitVec.ule", true)
+        simple_icmp(ICMP_SLT, "BitVec.slt", false)
+        simple_icmp(ICMP_SLE, "BitVec.sle", false)
+        simple_icmp(ICMP_SGT, "BitVec.slt", true)
+        simple_icmp(ICMP_SGE, "BitVec.sle", true)
+        default:
+          assert(false && "Unsupported icmp predicate");
+      }
+
+      #undef simple_icmp
+      stream << ")";
+    } else if (llvm::BranchInst* br = llvm::dyn_cast<llvm::BranchInst>(inst)) {
+      if (br->isConditional()) {
+        stream << "if ";
+        lower_value(stream, br->getCondition());
+        stream << " = 1#1 then ";
+        lower_block_call(stream, br->getParent(), br->getSuccessor(0));
+        stream << " else ";
+        lower_block_call(stream, br->getParent(), br->getSuccessor(1));
+      } else {
+        lower_block_call(stream, br->getParent(), br->getSuccessor(0));
+      }
+    } else if (llvm::ReturnInst* ret = llvm::dyn_cast<llvm::ReturnInst>(inst)) {
+      if (llvm::Value* value = ret->getReturnValue()) {
+        lower_value(stream, value);
+      } else {
+        stream << "()";
+      }
     } else {
       std::ostringstream message;
       message << "Unsupported instruction: " << inst->getOpcodeName();
       throw std::runtime_error(message.str());
     }
+    stream << "\n";
   }
 
 public:
@@ -116,14 +182,36 @@ public:
       _names[&block] = "b" + std::to_string(_names.size());
     }
 
-    _stream << "mutual\n";
+    for (llvm::Argument& arg : function.args()) {
+      _names[&arg] = "a" + std::to_string(_names.size());
+    }
+
+    _stream << "def " << function.getName().str();
+    for (llvm::Argument& arg : function.args()) {
+      _stream << " (" << _names[&arg] << " : ";
+      lower_type(_stream, arg.getType());
+      _stream << ")";
+    }
+    _stream << " : ";
+    lower_type(_stream, function.getReturnType());
+    _stream << " :=\n";
+    _stream << "  " << _names[&function.getEntryBlock()] << "\n";
+    _stream << "where\n";
     for (llvm::BasicBlock& block : function) {
-      _stream << "def " << _names[&block] << " :=\n";
+      _stream << "  " << _names[&block];
+      for (llvm::PHINode& phi : block.phis()) {
+        _names[&phi] = "v" + std::to_string(_names.size());
+        _stream << " (" << _names[&phi] << " : ";
+        lower_type(_stream, phi.getType());
+        _stream << ")";
+      }
+      _stream << " : ";
+      lower_type(_stream, function.getReturnType());
+      _stream << " :=\n";
       for (llvm::Instruction& inst : block) {
         lower_inst(_stream, &inst);
       }
     }
-    _stream << "end\n";
   }
 };
 
