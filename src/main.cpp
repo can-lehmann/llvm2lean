@@ -153,6 +153,36 @@ private:
     }
   }
 
+  std::vector<llvm::BasicBlock*> successors(llvm::Function& function, llvm::BasicBlock* block) {
+    std::vector<llvm::BasicBlock*> result(llvm::succ_begin(block), llvm::succ_end(block));
+    for (llvm::Instruction& inst : *block) {
+      if (llvm::CallInst* call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+        if (call->getCalledFunction() == &function) {
+          result.push_back(&function.getEntryBlock());
+        }
+      }
+    }
+    return result;
+  }
+
+  bool reaches(llvm::Function& function, llvm::BasicBlock* from, llvm::BasicBlock* to) {
+    std::set<llvm::BasicBlock*> visited;
+    std::vector<llvm::BasicBlock*> stack = successors(function, from);
+    while (!stack.empty()) {
+      llvm::BasicBlock* block = stack.back();
+      stack.pop_back();
+      if (block == to) {
+        return true;
+      }
+      if (visited.insert(block).second) {
+        for (llvm::BasicBlock* succ : successors(function, block)) {
+          stack.push_back(succ);
+        }
+      }
+    }
+    return false;
+  }
+
   void lower_type(std::ostream& stream, llvm::Type* type) {
     if (type->isIntegerTy(1)) {
       stream << "Bool";
@@ -169,11 +199,11 @@ private:
 
   void lower_return_type(std::ostream& stream, llvm::Type* type) {
     if (type->isVoidTy()) {
-      stream << "Mem";
+      stream << "(Option Mem)";
     } else {
-      stream << "(Mem × ";
+      stream << "(Option (Mem × ";
       lower_type(stream, type);
-      stream << ")";
+      stream << "))";
     }
   }
 
@@ -380,9 +410,9 @@ private:
         throw std::runtime_error("Unsupported call target");
       }
       if (call->getType()->isVoidTy()) {
-        stream << "let mem := (";
+        stream << "let mem ← (";
       } else {
-        stream << "let (mem, " << _names[inst] << ") := (";
+        stream << "let (mem, " << _names[inst] << ") ← (";
       }
       stream << callee->getName().str() << " mem";
       for (llvm::Value* arg : call->args()) {
@@ -392,11 +422,11 @@ private:
       stream << ")";
     } else if (llvm::ReturnInst* ret = llvm::dyn_cast<llvm::ReturnInst>(inst)) {
       if (llvm::Value* value = ret->getReturnValue()) {
-        stream << "(mem, ";
+        stream << "pure (mem, ";
         lower_value(stream, value);
         stream << ")";
       } else {
-        stream << "mem";
+        stream << "pure mem";
       }
     } else {
       std::ostringstream message;
@@ -428,7 +458,14 @@ public:
 
     compute_live_in(function);
 
-    _stream << "partial def " << function.getName().str() << " (mem : Mem)";
+    bool is_recursive = false;
+    for (llvm::Instruction& inst : llvm::instructions(function)) {
+      if (llvm::CallInst* call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+        is_recursive = is_recursive || call->getCalledFunction() == &function;
+      }
+    }
+
+    _stream << "def " << function.getName().str() << " (mem : Mem)";
     for (llvm::Argument& arg : function.args()) {
       _stream << " (" << _names[&arg] << " : ";
       lower_type(_stream, arg.getType());
@@ -438,6 +475,9 @@ public:
     lower_return_type(_stream, function.getReturnType());
     _stream << " :=\n";
     _stream << "  " << _names[&function.getEntryBlock()] << " mem\n";
+    if (is_recursive) {
+      _stream << "partial_fixpoint\n";
+    }
     _stream << "where\n";
     for (llvm::BasicBlock& block : function) {
       _stream << "  " << _names[&block] << " (mem : Mem)";
@@ -453,9 +493,12 @@ public:
       }
       _stream << " : ";
       lower_return_type(_stream, function.getReturnType());
-      _stream << " :=\n";
+      _stream << " := do\n";
       for (llvm::Instruction& inst : block) {
         lower_inst(_stream, &inst);
+      }
+      if (reaches(function, &block, &block)) {
+        _stream << "  partial_fixpoint\n";
       }
     }
   }
