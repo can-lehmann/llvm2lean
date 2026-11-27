@@ -24,6 +24,8 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DataLayout.h>
+#include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/ModuleSlotTracker.h>
@@ -51,9 +53,25 @@ static llvm::cl::opt<std::string> output_filename(
   llvm::cl::cat(llvm2lean_category)
 );
 
+static const char* lean_prelude = R"(abbrev Mem := Nat → BitVec 64 → BitVec 8
+abbrev Ptr := Nat × BitVec 64
+
+def Mem.load (mem : Mem) (ptr : Ptr) (w : Nat) : BitVec w :=
+  BitVec.ofNat w ((List.range ((w + 7) / 8)).foldr (fun i acc => (mem ptr.1 (ptr.2 + BitVec.ofNat 64 i)).toNat + acc * 256) 0)
+
+def Mem.store {w : Nat} (mem : Mem) (ptr : Ptr) (value : BitVec w) : Mem :=
+  fun id offset =>
+    if id = ptr.1 ∧ (offset - ptr.2).toNat < (w + 7) / 8 then
+      BitVec.setWidth 8 (value >>> (8 * (offset - ptr.2).toNat))
+    else
+      mem id offset
+
+)";
+
 class LeanLowering {
 private:
   std::ostream& _stream;
+  const llvm::DataLayout& _data_layout;
   std::unordered_map<llvm::Value*, std::string> _names;
   std::unordered_map<llvm::BasicBlock*, std::vector<llvm::Instruction*>> _live_in;
 
@@ -115,10 +133,33 @@ private:
       stream << "Bool";
     } else if (llvm::IntegerType* integer_type = llvm::dyn_cast<llvm::IntegerType>(type)) {
       stream << "(BitVec " << integer_type->getBitWidth() << ")";
+    } else if (type->isPointerTy()) {
+      stream << "Ptr";
     } else if (type->isVoidTy()) {
       stream << "Unit";
     } else {
       assert(false && "Unsupported type");
+    }
+  }
+
+  void lower_return_type(std::ostream& stream, llvm::Type* type) {
+    if (type->isVoidTy()) {
+      stream << "Mem";
+    } else {
+      stream << "(Mem × ";
+      lower_type(stream, type);
+      stream << ")";
+    }
+  }
+
+  void lower_index(std::ostream& stream, llvm::Value* index) {
+    unsigned width = index->getType()->getIntegerBitWidth();
+    if (width == 64) {
+      lower_value(stream, index);
+    } else {
+      stream << "(BitVec.signExtend 64 ";
+      lower_value(stream, index);
+      stream << ")";
     }
   }
 
@@ -141,7 +182,7 @@ private:
   }
 
   void lower_block_call(std::ostream& stream, llvm::BasicBlock* from, llvm::BasicBlock* to) {
-    stream << "(" << _names[to];
+    stream << "(" << _names[to] << " mem";
     for (llvm::PHINode& phi : to->phis()) {
       stream << " ";
       lower_value(stream, phi.getIncomingValueForBlock(from));
@@ -220,11 +261,56 @@ private:
       } else {
         lower_block_call(stream, br->getParent(), br->getSuccessor(0));
       }
+    } else if (llvm::LoadInst* load = llvm::dyn_cast<llvm::LoadInst>(inst)) {
+      llvm::Type* type = load->getType();
+      if (!type->isIntegerTy()) {
+        throw std::runtime_error("Unsupported load type");
+      }
+      stream << "let " << _names[inst] << " := (Mem.load mem ";
+      lower_value(stream, load->getPointerOperand());
+      stream << " " << type->getIntegerBitWidth() << ")";
+      if (type->isIntegerTy(1)) {
+        stream << " == 1#1";
+      }
+    } else if (llvm::StoreInst* store = llvm::dyn_cast<llvm::StoreInst>(inst)) {
+      llvm::Value* value = store->getValueOperand();
+      if (!value->getType()->isIntegerTy()) {
+        throw std::runtime_error("Unsupported store type");
+      }
+      stream << "let mem := (Mem.store mem ";
+      lower_value(stream, store->getPointerOperand());
+      stream << " ";
+      if (value->getType()->isIntegerTy(1)) {
+        stream << "(BitVec.ofBool ";
+        lower_value(stream, value);
+        stream << ")";
+      } else {
+        lower_value(stream, value);
+      }
+      stream << ")";
+    } else if (llvm::GetElementPtrInst* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(inst)) {
+      stream << "let " << _names[inst] << " := (";
+      lower_value(stream, gep->getPointerOperand());
+      stream << ".1, ";
+      lower_value(stream, gep->getPointerOperand());
+      stream << ".2";
+      for (llvm::gep_type_iterator it = llvm::gep_type_begin(gep); it != llvm::gep_type_end(gep); ++it) {
+        if (llvm::StructType* struct_type = it.getStructTypeOrNull()) {
+          unsigned field = llvm::cast<llvm::ConstantInt>(it.getOperand())->getZExtValue();
+          stream << " + (" << _data_layout.getStructLayout(struct_type)->getElementOffset(field).getFixedValue() << " : (BitVec 64))";
+        } else {
+          stream << " + (" << it.getSequentialElementStride(_data_layout).getFixedValue() << " : (BitVec 64)) * ";
+          lower_index(stream, it.getOperand());
+        }
+      }
+      stream << ")";
     } else if (llvm::ReturnInst* ret = llvm::dyn_cast<llvm::ReturnInst>(inst)) {
       if (llvm::Value* value = ret->getReturnValue()) {
+        stream << "(mem, ";
         lower_value(stream, value);
+        stream << ")";
       } else {
-        stream << "()";
+        stream << "mem";
       }
     } else {
       std::ostringstream message;
@@ -235,7 +321,9 @@ private:
   }
 
 public:
-  LeanLowering(std::ostream& stream, llvm::Module& module): _stream(stream) {}
+  LeanLowering(std::ostream& stream, llvm::Module& module): _stream(stream), _data_layout(module.getDataLayout()) {
+    _stream << lean_prelude;
+  }
 
   void lower(llvm::Function& function) {
     for (llvm::BasicBlock& block : function) {
@@ -254,19 +342,19 @@ public:
 
     compute_live_in(function);
 
-    _stream << "partial def " << function.getName().str();
+    _stream << "partial def " << function.getName().str() << " (mem : Mem)";
     for (llvm::Argument& arg : function.args()) {
       _stream << " (" << _names[&arg] << " : ";
       lower_type(_stream, arg.getType());
       _stream << ")";
     }
     _stream << " : ";
-    lower_type(_stream, function.getReturnType());
+    lower_return_type(_stream, function.getReturnType());
     _stream << " :=\n";
-    _stream << "  " << _names[&function.getEntryBlock()] << "\n";
+    _stream << "  " << _names[&function.getEntryBlock()] << " mem\n";
     _stream << "where\n";
     for (llvm::BasicBlock& block : function) {
-      _stream << "  " << _names[&block];
+      _stream << "  " << _names[&block] << " (mem : Mem)";
       for (llvm::PHINode& phi : block.phis()) {
         _stream << " (" << _names[&phi] << " : ";
         lower_type(_stream, phi.getType());
@@ -278,7 +366,7 @@ public:
         _stream << ")";
       }
       _stream << " : ";
-      lower_type(_stream, function.getReturnType());
+      lower_return_type(_stream, function.getReturnType());
       _stream << " :=\n";
       for (llvm::Instruction& inst : block) {
         lower_inst(_stream, &inst);
