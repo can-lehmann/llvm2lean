@@ -14,9 +14,17 @@
 
 #include <memory>
 #include <system_error>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
 
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/CFG.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/ModuleSlotTracker.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
@@ -41,6 +49,84 @@ static llvm::cl::opt<std::string> output_filename(
   llvm::cl::cat(llvm2lean_category)
 );
 
+class LeanLowering {
+private:
+  std::ostream& _stream;
+  std::unordered_map<llvm::Value*, std::string> _names;
+
+  void lower_type(std::ostream& stream, llvm::Type* type) {
+    if (llvm::IntegerType* integer_type = llvm::dyn_cast<llvm::IntegerType>(type)) {
+      stream << "(BitVec " << integer_type->getBitWidth() << ")";
+    } else {
+      assert(false && "Unsupported type");
+    }
+  }
+
+  void lower_value(std::ostream& stream, llvm::Value* value) {
+    if (_names.find(value) != _names.end()) {
+      stream << _names[value];
+    } else if (llvm::ConstantInt* constant_int = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+      stream << "(";
+      llvm::SmallVector<char, 32> str;
+      constant_int->getValue().toStringUnsigned(str, 10);
+      stream << str.data();
+      stream << " : ";
+      lower_type(stream, constant_int->getType());
+      stream << ")";
+    } else {
+      assert(false && "Unsupported value");
+    }
+  }
+
+  void lower_inst(std::ostream& stream, llvm::Instruction* inst) {
+    _names[inst] = "v" + std::to_string(_names.size());
+    if (llvm::BinaryOperator* binop = llvm::dyn_cast<llvm::BinaryOperator>(inst)) {
+      stream << "let " << _names[inst] << " := ";
+
+      #define simple_binop(Kind, op) \
+        case llvm::Instruction::Kind: \
+          stream << "("; \
+          lower_value(stream, binop->getOperand(0)); \
+          stream << " " op " "; \
+          lower_value(stream, binop->getOperand(1)); \
+          stream << ")"; \
+          break;
+      
+      switch (binop->getOpcode()) {
+        simple_binop(Add, "+")
+        simple_binop(Sub, "-")
+        simple_binop(Mul, "*")
+        default:
+          assert(false && "Unsupported binary operator");
+      }
+      
+      #undef simple_binop
+    } else {
+      std::ostringstream message;
+      message << "Unsupported instruction: " << inst->getOpcodeName();
+      throw std::runtime_error(message.str());
+    }
+  }
+
+public:
+  LeanLowering(std::ostream& stream, llvm::Module& module): _stream(stream) {}
+
+  void lower(llvm::Function& function) {
+    for (llvm::BasicBlock& block : function) {
+      _names[&block] = "b" + std::to_string(_names.size());
+    }
+
+    _stream << "mutual\n";
+    for (llvm::BasicBlock& block : function) {
+      _stream << "def " << _names[&block] << " :=\n";
+      for (llvm::Instruction& inst : block) {
+        lower_inst(_stream, &inst);
+      }
+    }
+    _stream << "end\n";
+  }
+};
+
 int main(int argc, char** argv) {
   llvm::InitLLVM init(argc, argv);
   llvm::cl::HideUnrelatedOptions(llvm2lean_category);
@@ -54,13 +140,18 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::error_code ec;
-  llvm::raw_fd_ostream out(output_filename, ec, llvm::sys::fs::OF_Text);
-  if (ec) {
-    llvm::errs() << argv[0] << ": " << output_filename << ": " << ec.message() << "\n";
+  std::ofstream out(output_filename);
+  if (!out) {
+    llvm::errs() << argv[0] << ": " << output_filename << ": " << "Failed to open file for writing\n";
     return 1;
   }
 
-  module->print(out, nullptr);
+  LeanLowering lowering(out, *module);
+  for (llvm::Function& function : *module) {
+    if (!function.isDeclaration()) {
+      lowering.lower(function);
+    }
+  }
+
   return 0;
 }
