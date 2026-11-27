@@ -213,15 +213,32 @@ private:
           stream << ")"; \
           break;
       
+      #define function_binop(Kind, function) \
+        case llvm::Instruction::Kind: \
+          if (is_bool) { \
+            throw std::runtime_error("Unsupported boolean binary operator"); \
+          } \
+          stream << "(" function " "; \
+          lower_value(stream, binop->getOperand(0)); \
+          stream << " "; \
+          lower_value(stream, binop->getOperand(1)); \
+          stream << ")"; \
+          break;
+
       switch (binop->getOpcode()) {
         simple_binop(Add, "+", "^^")
         simple_binop(Sub, "-", "^^")
         simple_binop(Mul, "*", "&&")
+        function_binop(UDiv, "BitVec.udiv")
+        function_binop(SDiv, "BitVec.sdiv")
+        function_binop(URem, "BitVec.umod")
+        function_binop(SRem, "BitVec.srem")
         default:
           assert(false && "Unsupported binary operator");
       }
-      
+
       #undef simple_binop
+      #undef function_binop
     } else if (llvm::ICmpInst* icmp = llvm::dyn_cast<llvm::ICmpInst>(inst)) {
       stream << "let " << _names[inst] << " := ";
 
@@ -302,6 +319,22 @@ private:
           stream << " + (" << it.getSequentialElementStride(_data_layout).getFixedValue() << " : (BitVec 64)) * ";
           lower_index(stream, it.getOperand());
         }
+      }
+      stream << ")";
+    } else if (llvm::CallInst* call = llvm::dyn_cast<llvm::CallInst>(inst)) {
+      llvm::Function* callee = call->getCalledFunction();
+      if (!callee || callee->isDeclaration()) {
+        throw std::runtime_error("Unsupported call target");
+      }
+      if (call->getType()->isVoidTy()) {
+        stream << "let mem := (";
+      } else {
+        stream << "let (mem, " << _names[inst] << ") := (";
+      }
+      stream << callee->getName().str() << " mem";
+      for (llvm::Value* arg : call->args()) {
+        stream << " ";
+        lower_value(stream, arg);
       }
       stream << ")";
     } else if (llvm::ReturnInst* ret = llvm::dyn_cast<llvm::ReturnInst>(inst)) {
